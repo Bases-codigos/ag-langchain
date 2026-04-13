@@ -1,38 +1,34 @@
 # Definimos el estado del grafo y el contexto
 
 from dataclasses import dataclass
+from typing import Any
+from typing import Literal
 from typing_extensions import TypedDict, NotRequired
-
-from esquemas import (
-    EntradaIncidente,
-    CasoExtraido,
-    EvaluacionInformacionFaltante,
-    CasoSimilar,
-    DecisionCaso,
-    CasoConocimiento,
-)
 
 # ============================================================
 # Estado del grafo
 # ============================================================
-class EstadoKB(TypedDict):
+class EstadoKB(TypedDict, total=False):
     """
     Estado global de flujo
 
     No todos los campos existen desde el inicio; muchos aparecen
     cuando alún nodo los produce
     """
-    incidente: EntradaIncidente
+    texto_usuario: str
+    tipo_entrada: Literal["pregunta_general", "incidente_tecnico"]
+    incidente: dict[str, Any]
 
-    caso_extraido: NotRequired[CasoExtraido]
-    completitud: NotRequired[EvaluacionInformacionFaltante]
+    caso_extraido: NotRequired[dict[str, Any]]
+    completitud: NotRequired[dict[str, Any]]
     rondas_aclaracion: NotRequired[int]
     aclaraciones_usuario: NotRequired[list[dict[str, str]]]
-    casos_similares: NotRequired[list[CasoSimilar]]
-    decision_caso: NotRequired[DecisionCaso]
+    casos_similares: NotRequired[list[dict[str, Any]]]
+    decision_caso: NotRequired[dict[str, Any]]
     resumen_revision: NotRequired[str]
-    caso_persistido: NotRequired[CasoConocimiento]
+    caso_persistido: NotRequired[dict[str, Any]]
     motivo_detencion: NotRequired[str]
+    respuesta: NotRequired[str]
 
 # ============================================================
 # Contexto del runtime
@@ -43,11 +39,6 @@ class EstadoKB(TypedDict):
 # - namespaces
 # - límites de configuración
 # ============================================================
-class EstadoChat(TypedDict):
-    pregunta: str
-    respuesta: NotRequired[str]
-
-
 @dataclass
 class ContextoAplicacion:
     id_tenant: str

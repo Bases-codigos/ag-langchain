@@ -1,15 +1,18 @@
 import uuid
+from typing import Literal
 from langgraph.runtime import Runtime
 from langgraph.types import interrupt
+from pydantic import BaseModel
 from configuracion import modelo_llm, almacen_vectorial
 from esquemas import (
+    EntradaIncidente,
     CasoExtraido,
     EvaluacionInformacionFaltante,
     CasoSimilar,
     DecisionCaso,
     CasoConocimiento,
     )
-from estado import EstadoKB, ContextoAplicacion, EstadoChat
+from estado import EstadoKB, ContextoAplicacion
 from utilidades import (
     obtener_fecha_utl_actual,
     convertir_caso_a_documento,
@@ -20,11 +23,83 @@ from utilidades import (
 # ============================================================
 # Nodos del grafo
 # ============================================================
+class ClasificacionEntrada(BaseModel):
+    tipo_entrada: Literal["pregunta_general", "incidente_tecnico"]
+
+
+def interpretar_entrada_usuario(
+        state: EstadoKB,
+        runtime: Runtime[ContextoAplicacion],
+) -> dict:
+    """
+    Interpreta texto libre y decide si es pregunta general o incidente técnico.
+    Si el incidente ya llega estructurado, lo clasifica directo como incidente.
+    """
+    incidente = state.get("incidente")
+    if incidente is not None:
+        if hasattr(incidente, "model_dump"):
+            incidente = incidente.model_dump()
+        return {
+            "tipo_entrada": "incidente_tecnico",
+            "incidente": incidente,
+        }
+
+    texto_usuario = state.get("texto_usuario", "").strip()
+    if not texto_usuario:
+        return {"tipo_entrada": "pregunta_general"}
+
+    clasificador = modelo_llm.with_structured_output(ClasificacionEntrada)
+    prompt = f"""
+Clasifica este mensaje en una sola categoría:
+- pregunta_general: consulta conceptual o informativa
+- incidente_tecnico: reporte de error, fallo o problema operativo
+
+Mensaje del usuario:
+{texto_usuario}
+"""
+    salida = clasificador.invoke(prompt)
+    return {"tipo_entrada": salida.tipo_entrada}
+
+
+def enrutador_tipo_entrada(state: EstadoKB) -> str:
+    if state.get("tipo_entrada") == "incidente_tecnico":
+        return "construir_incidente_desde_texto"
+    return "responder_pregunta"
+
+
+def construir_incidente_desde_texto(
+        state: EstadoKB,
+        runtime: Runtime[ContextoAplicacion],
+) -> dict:
+    """
+    Convierte entrada libre en EntradaIncidente cuando no viene estructurada.
+    """
+    if state.get("incidente") is not None:
+        return {}
+
+    texto_usuario = state.get("texto_usuario", "").strip()
+    extractor = modelo_llm.with_structured_output(EntradaIncidente)
+    prompt = f"""
+Convierte este texto en un incidente técnico estructurado.
+
+Reglas:
+- Si falta id_incidente, crea uno con prefijo CHAT-INC.
+- Si faltan mensaje_error o extracto_logs, usa "no_provisto".
+- Si no se menciona resolución, usa resolucion_aplicada=null y resuelto=false.
+- No inventes detalles fuera del texto.
+
+Texto:
+{texto_usuario}
+"""
+    incidente = extractor.invoke(prompt)
+    return {"incidente": incidente.model_dump()}
+
+
 def extraer_caso(state: EstadoKB, runtime: Runtime[ContextoAplicacion]) -> dict:
     """
     Convierte un incidente en un caso estructurado reutilizable.
     """
-    incidente = state["incidente"]
+    incidente = EntradaIncidente(**state["incidente"])
     aclaraciones = state.get("aclaraciones_usuario", [])
 
     extractor = modelo_llm.with_structured_output(CasoExtraido)
@@ -42,14 +117,14 @@ Reglas:
 """
     caso_extraido = extractor.invoke(prompt)
 
-    return {"caso_extraido": caso_extraido}
+    return {"caso_extraido": caso_extraido.model_dump()}
 
 def evaluar_completitud(state: EstadoKB, runtime: Runtime[ContextoAplicacion]) -> dict:
     """
     Evalúa si hay suficiente información para guardar conocimiento útil.
     """
-    incidente = state["incidente"]
-    caso_extraido = state["caso_extraido"]
+    incidente = EntradaIncidente(**state["incidente"])
+    caso_extraido = CasoExtraido(**state["caso_extraido"])
     aclaraciones = state.get("aclaraciones_usuario", [])
 
     evaluador = modelo_llm.with_structured_output(EvaluacionInformacionFaltante)
@@ -73,7 +148,7 @@ Borrador del caso:
 {caso_extraido.model_dump_json(indent=2)}
 """
     completitud = evaluador.invoke(prompt)
-    return {"completitud": completitud}
+    return {"completitud": completitud.model_dump()}
 
 def enrutador_aclaraciones(state: EstadoKB) -> str:
     """
@@ -81,7 +156,7 @@ def enrutador_aclaraciones(state: EstadoKB) -> str:
     """
     completitud = state["completitud"]
     rondas = state.get("rondas_aclaracion", 0)
-    if completitud.esta_completo:
+    if completitud.get("esta_completo", False):
         return "buscar_casos_similares"
 
     if rondas >= 3:
@@ -102,8 +177,8 @@ def pedir_aclaracion_usuario(
     carga = {
         "tipo": "solicitud_aclaracion",
         "ronda": rondas + 1,
-        "preguntas": completitud.preguntas_para_usuario,
-        "campos_faltantes": completitud.campos_faltantes,
+        "preguntas": completitud.get("preguntas_para_usuario", []),
+        "campos_faltantes": completitud.get("campos_faltantes", []),
         "instruccion": "Responde las preguntas con el mayor detalle posible."
     }
 
@@ -120,7 +195,7 @@ def pedir_aclaracion_usuario(
 
     return {
         "aclaraciones_usuario": existentes + respuestas,
-        "rondas_aclaraciones": rondas + 1,
+        "rondas_aclaracion": rondas + 1,
     }
 
 def detener_caso_incompleto(
@@ -147,18 +222,18 @@ def buscar_casos_similares(
     caso_extraido = state["caso_extraido"]
 
     resultados = almacen_vectorial.similarity_search(
-        caso_extraido.texto_canonico,
+        caso_extraido["texto_canonico"],
         k = 5,
         filter = {"id_tenant": runtime.context.id_tenant}
     )
-    casos_similares: list[CasoSimilar] = []
+    casos_similares: list[dict] = []
     for indice, doc in enumerate(resultados):
         casos_similares.append(CasoSimilar(
             id_caso=doc.metadata["id_caso"],
             titulo=doc.metadata.get("titulo", "Sin titulo"),
             estado=doc.metadata.get("estado", "candidato"),
             puntaje=normalizar_puntaje(indice),
-        ))
+        ).model_dump())
 
     return {"casos_similares": casos_similares}
 
@@ -184,17 +259,17 @@ Clasifica el borrador en una de estas categorías:
 Si es existente y hay un caso objetivo claro, devuelve id_caso_objetivo.
 
 incidente:
-resuelto={incidente.resuelto}
-resolucion_aplicada={incidente.resolucion_aplicada}
+resuelto={incidente.get("resuelto")}
+resolucion_aplicada={incidente.get("resolucion_aplicada")}
 
 Borrador:
-{caso_extraido.model_dump_json(indent=2)}
+{CasoExtraido(**caso_extraido).model_dump_json(indent=2)}
 
 Similares:
-{[x.model_dump() for x in similares]}
+{similares}
 """
     decision_caso = clasificador.invoke(prompt)
-    return {"decision_caso": decision_caso}
+    return {"decision_caso": decision_caso.model_dump()}
 
 def preparar_revision_humana(
         state: EstadoKB,
@@ -211,23 +286,23 @@ def preparar_revision_humana(
     resumen = f"""
 Se propone añadir o actualizar conocimientos especializado.
 
-Incidente origen: {incidente.id_incidente}
-Servicio: {incidente.servicio}
-Entorno: {incidente.entorno}
+Incidente origen: {incidente.get("id_incidente")}
+Servicio: {incidente.get("servicio")}
+Entorno: {incidente.get("entorno")}
 
-Clasificación propuesta: {decision_caso.decision}
-Motivo: {decision_caso.motivo}
-Caso objetivo: {decision_caso.id_caso_objetivo}
+Clasificación propuesta: {decision_caso.get("decision")}
+Motivo: {decision_caso.get("motivo")}
+Caso objetivo: {decision_caso.get("id_caso_objetivo")}
 
-Titulo: {caso_extraido.titulo}
-Síntomas: {", ".join(caso_extraido.sintomas)}
-Causa probable: {caso_extraido.causa_raiz_probable}
-Resolución: {" | ".join(caso_extraido.resolucion)}
-Palabras clave: {", ".join(caso_extraido.palabras_clave)}
-Confianza: {caso_extraido.confianza}
+Titulo: {caso_extraido.get("titulo")}
+Síntomas: {", ".join(caso_extraido.get("sintomas", []))}
+Causa probable: {caso_extraido.get("causa_raiz_probable")}
+Resolución: {" | ".join(caso_extraido.get("resolucion", []))}
+Palabras clave: {", ".join(caso_extraido.get("palabras_clave", []))}
+Confianza: {caso_extraido.get("confianza")}
 
 Casos similares:
-{chr(10).join(f"- {c.id_caso} | {c.titulo} | {c.estado} | puntaje={c.puntaje}" for c in similares) or "- ninguno"}
+{chr(10).join(f"- {c.get('id_caso')} | {c.get('titulo')} | {c.get('estado')} | puntaje={c.get('puntaje')}" for c in similares) or "- ninguno"}
 """
     return {"resumen_revision": resumen}
 
@@ -244,7 +319,7 @@ def compuerta_revision_humana(
     carga = {
         "tipo": "revision_conocimiento",
         "resumen": resumen,
-        "caso_propuesto": caso_extraido.model_dump(),
+        "caso_propuesto": caso_extraido,
         "acciones_permitidas": ["aprobar", "rechazar", "editar"],
         "instrucciones": (
             "Aprueba, rechaza o edita el caso antes de publicarlo."
@@ -259,16 +334,16 @@ def compuerta_revision_humana(
 
     if accion == "editar":
         caso_editado = CasoExtraido(**revision["caso_editado"])
-        return {"caso_extraido": caso_editado}
+        return {"caso_extraido": caso_editado.model_dump()}
 
     return {}
 
 def enrutador_revision(state: EstadoKB) -> str:
     """
-    Si el caso fue rechazado, termina. Si no, persiste
+    Si el caso fue rechazado, responde al usuario. Si no, persiste.
     """
     if state.get("motivo_detencion"):
-        return "END"
+        return "responder_resultado_incidente"
     return "persistir_caso"
 
 def  persistir_caso(
@@ -278,8 +353,8 @@ def  persistir_caso(
     """
     Guarda el caso final en el store persistente.
     """
-    incidente = state["incidente"]
-    caso_extraido = state["caso_extraido"]
+    incidente = EntradaIncidente(**state["incidente"])
+    caso_extraido = CasoExtraido(**state["caso_extraido"])
 
     ahora = obtener_fecha_utl_actual()
 
@@ -306,7 +381,7 @@ def  persistir_caso(
         caso.model_dump(),
     )
 
-    return {"caso_persistido": caso}
+    return {"caso_persistido": caso.model_dump()}
 
 def indexar_caso(
         state: EstadoKB,
@@ -315,7 +390,7 @@ def indexar_caso(
     """
     Indexa el caso persistido en el almacén vectorial.
     """
-    caso = state["caso_persistido"]
+    caso = CasoConocimiento(**state["caso_persistido"])
 
     doc = convertir_caso_a_documento(caso)
     doc.metadata["id_tenant"] = runtime.context.id_tenant
@@ -324,16 +399,56 @@ def indexar_caso(
 
     return {}
 
-def responder_pregunta(
-        state: EstadoChat,
+
+def responder_resultado_incidente(
+        state: EstadoKB,
         runtime: Runtime[ContextoAplicacion],
 ) -> dict:
-    pregunta = state["pregunta"]
-    prompt = f"""
-Responde de forma clara y breve a la siguiente pregunta:
+    """
+    Devuelve una respuesta textual final para el flujo de incidente.
+    """
+    incidente = state.get("incidente")
+    completitud = state.get("completitud")
+    decision = state.get("decision_caso")
+    similares = state.get("casos_similares", [])
+    motivo_detencion = state.get("motivo_detencion")
 
-Pregunta:
-{pregunta}
+    prompt = f"""
+Eres un agente de soporte técnico.
+Responde de forma clara, breve y accionable en español.
+
+Formato de salida:
+1) Diagnóstico breve
+2) Próximos 3 pasos
+3) Información adicional útil a pedir (si aplica)
+
+Contexto:
+- incidente: {incidente if incidente else "no_disponible"}
+- completitud: {completitud if completitud else "no_disponible"}
+- decision_caso: {decision if decision else "no_disponible"}
+- casos_similares: {similares}
+- motivo_detencion: {motivo_detencion or "ninguno"}
 """
     respuesta = modelo_llm.invoke(prompt)
-    return {"respuesta": respuesta.contenido}
+    return {"respuesta": respuesta.content}
+
+
+def responder_pregunta(
+        state: EstadoKB,
+        runtime: Runtime[ContextoAplicacion],
+) -> dict:
+    """
+    Ruta para preguntas generales tipo chat.
+    """
+    texto_usuario = state.get("texto_usuario", "").strip()
+    if not texto_usuario:
+        return {"respuesta": "No se recibió un mensaje para responder."}
+
+    prompt = f"""
+Responde de forma clara y breve en español.
+
+Pregunta del usuario:
+{texto_usuario}
+"""
+    respuesta = modelo_llm.invoke(prompt)
+    return {"respuesta": respuesta.content}

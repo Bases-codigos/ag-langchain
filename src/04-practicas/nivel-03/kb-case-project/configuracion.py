@@ -1,6 +1,7 @@
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_postgres import PGEngine, PGVectorStore
 from dotenv import load_dotenv
+from sqlalchemy.exc import ProgrammingError
 
 load_dotenv()
 
@@ -26,10 +27,15 @@ motor_vectorial = PGEngine.from_connection_string(url=URI_BD_VECTOR)
 
 # Crear tabla vectorial si aún no existe
 # text-embedding-3-small normalmente usa 1536 dimensiones
-motor_vectorial.init_vectorstore_table(
-    table_name="casos_errores_empresa",
-    vector_size=1536,
-)
+try:
+    motor_vectorial.init_vectorstore_table(
+        table_name="casos_errores_empresa",
+        vector_size=1536,
+    )
+except ProgrammingError as exc:
+    # Si la tabla ya existe, continuamos sin fallar.
+    if "already exists" not in str(exc).lower():
+        raise
 
 # Vector store moderno
 almacen_vectorial = PGVectorStore.create_sync(
