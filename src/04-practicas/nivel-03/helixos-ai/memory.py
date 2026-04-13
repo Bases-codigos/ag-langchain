@@ -17,5 +17,12 @@ store.put(
 store.put(
     ("tenant_policies",),
     "acme_corp",
-
+    {
+        "refund_window_days": 7,
+        "requires_human_for_prod_actions": True,
+    }
 )
+
+# Store es la memoria persistente cross-thread. La organización recomendada
+# namespace + key + json document, y para producción la documentación recomienda
+# un store persistente como Postgres o Redis

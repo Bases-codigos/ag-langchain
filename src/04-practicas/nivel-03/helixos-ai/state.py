@@ -2,10 +2,12 @@
 from typing import Annotated, Literal
 from typing_extensions import TypedDict
 from langgraph.graph.message import add_messages
+import operator
 
 class HelixState(TypedDict, total=False):
     user_message: str
     route: Literal["billing", "incident", "research", "mixed", "clarify"]
+    severity: Literal["low", "medium", "high", "critical"]
     requires_human_approval: bool
 
     billing_result: str
@@ -16,9 +18,9 @@ class HelixState(TypedDict, total=False):
     active_skills: list[str]
 
     # Reducers: agregan evidencia producida por distintos nodos/subagentes
-    notes: Annotated[list[str], add_messages]
-    actions_taken: Annotated[list[str], add_messages]
-    escalations: Annotated[list[str], add_messages]
+    notes: Annotated[list[str], operator.add]
+    actions_taken: Annotated[list[str], operator.add]
+    escalations: Annotated[list[str], operator.add]
 
 # Se usa reducers para campos donde varios nodos pueden escribir sin pisarse
 # Esa es la idea natural para listas de evidencia, acciones o hallazgos en
